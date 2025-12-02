@@ -18,7 +18,7 @@ from xgboost import XGBClassifier
 from scipy.stats import skew, kurtosis
 import warnings
 
-from Swin import SwinTransformer, extract_latent, get_swin_latent_features, depth_tensor, depth_tensor_test, depth_mean, depth_std, g_train, g_test
+from Swin_grid import SwinTransformer, extract_latent, get_swin_latent_features, depth_tensor, depth_tensor_test, depth_mean, depth_std, g_train, g_test
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Device:", device)
@@ -84,7 +84,7 @@ model_cat = CatBoostClassifier(
         verbose=0,
         class_weights=[1.0, float(scale_pos_weight)],
         task_type="CPU",        # GPU 쓰면 비결정성 있을 수 있음
-        bootstrap_type="No" #********************************************확인해야 할 부분**************************************
+        bootstrap_type="No"
     )
 
 model_xgb = XGBClassifier(
@@ -197,7 +197,7 @@ def find_best_N(val_pred, val_label, min_N=10, max_N=None):
 
     N_total = len(val_pred)
     max_N = round(len(val_pred) * 0.42)
-    min_N = round(len(val_pred) * 0.25) #**************************************************확인해야 할 부분*******************************************************
+    min_N = round(len(val_pred) * 0.25)
 
     idx_sorted = np.argsort(val_pred)  # 낮은 확률 → 승인 후보
 
