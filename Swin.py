@@ -100,15 +100,33 @@ K = len(x_loc)
 
 def depth_image(x,y,p, x_loc, y_loc, radius=0, H=16, W=16,
                 use_gaussian_mask=True):
-    x = torch.tensor(x).float()
-    y = torch.tensor(y).float()
-    p = torch.tensor(p).float()
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
 
-    assert x.shape == y.shape == p.shape
+    x_min, x_max = x.min(), x.max()
+    y_min, y_max = y.min(), y.max()
 
-    depth = p.view(H, W)
-    x_g = x.view(H, W)
-    y_g = y.view(H, W)
+    grid_x, grid_y = np.meshgrid(
+        np.linspace(x_min, x_max, W),
+        np.linspace(y_min, y_max, H)
+    )
+
+    points = np.stack([x, y], axis=1)
+
+    img = griddata(points, p, (grid_x, grid_y),
+                   method='cubic',  # 안되면 'linear'도 좋음
+                   fill_value=p.mean())
+
+    depth_np = img.astype("float32")
+    depth = torch.from_numpy(depth_np).to(device)  # [H, W]
+
+    # 좌표 채널 생성 (torch.linspace 사용, numpy 안 거침)
+    x_g = torch.linspace(x_min, x_max, W, device=depth.device) \
+        .view(1, W).repeat(H, 1)  # [H, W]
+
+    y_g = torch.linspace(y_min, y_max, H, device=depth.device) \
+        .view(H, 1).repeat(1, W)
 
     masks = []
     for Xi, Yi in zip(x_loc, y_loc):
@@ -122,8 +140,8 @@ def depth_image(x,y,p, x_loc, y_loc, radius=0, H=16, W=16,
     loc_masks = torch.stack(masks, dim=0)
 
     # ----- 2) CoordConv 채널 추가
-    xs = torch.linspace(-1, 1, W).view(1, W).repeat(H, 1)
-    ys = torch.linspace(-1, 1, H).view(H, 1).repeat(1, W)
+    xs = torch.linspace(-1, 1, W, device=depth.device).view(1, W).repeat(H, 1)
+    ys = torch.linspace(-1, 1, H, device=depth.device).view(H, 1).repeat(1, W)
     coord_x = xs.unsqueeze(0)  # [1, H, W]
     coord_y = ys.unsqueeze(0)
 
@@ -213,7 +231,7 @@ class SwinTransformer(nn.Module):
             nn.Linear(128, 1),
         )
 
-    def forward(self, x, loc):
+    def forward_features(self, x, loc):
         if x.shape[-1] != self.img_size or x.shape[-2] != self.img_size:
             x = F.interpolate(
                 x,
@@ -221,11 +239,16 @@ class SwinTransformer(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )  # [B, C, 32, 32]
-        x_logits = self.backbone(x) #[B,1]
 
-        loc_logits = self.coord_mlp(loc)
+        img_feat = self.backbone(x)  # [B, backbone_dim]  (이미지 임베딩)
+        loc_feat = self.coord_mlp(loc)
 
-        logit = self.classifier(torch.cat([x_logits, loc_logits], dim=1))
+        fused_feat = torch.cat([img_feat, loc_feat], dim=1)  # [B, backbone_dim+coord_emb_dim]
+        return fused_feat
+
+    def forward(self, x, loc):
+        feat = self.forward_features(x, loc)
+        logit = self.classifier(feat)
         return logit.squeeze(1)   #[B]
 
 depth_channel = depth_tensor[:, 0, :, :]  # [N,H,W]
@@ -302,6 +325,66 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         print(f"best_score = {self.best_score:.4f}")
 
+def get_swin_latent_features(model, device,
+                             depth_tensor, g_train, train_Y,
+                             depth_tensor_test, g_test,
+                             depth_mean, depth_std,
+                             batch_size=64):
+    # 1) train용 dataset / loader
+    dataset = FEMDepthDataset(depth_tensor, g_train, train_Y.values,
+                              depth_mean=depth_mean, depth_std=depth_std)
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    # 2) test용 dataset / loader
+    test_dataset = FEMDepthTestDataset(depth_tensor_test, g_test,
+                                       depth_mean, depth_std)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # 3) latent 뽑기 (전체 train / 전체 test)
+    X_img_train, y_from_loader = extract_latent(train_loader, model, device)
+    X_img_test, _ = extract_latent(test_loader, model, device)
+
+    return X_img_train, X_img_test, y_from_loader
+
+def extract_latent(loader, model, device):
+    """
+    DataLoader에서 (image, g[, label])을 받아
+    model.forward_features(image, g)로 latent feature를 뽑고
+    numpy array로 반환하는 함수.
+
+    반환:
+        X_feat: (N, D) latent feature (numpy)
+        y     : (N,) label (numpy) or None (레이블이 없으면)
+    """
+    model.eval()
+    all_feat = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in loader:
+            # batch 구성에 따라 분기: (img, g, label) 또는 (img, g)
+            if len(batch) == 3:
+                images, g_batch, labels = batch
+            else:
+                images, g_batch = batch
+                labels = None
+
+            images = images.to(device)
+            g_batch = g_batch.to(device)
+
+            # Swin 모델의 latent feature 추출
+            feat = model.forward_features(images, g_batch)  # [B, D]
+            all_feat.append(feat.cpu().numpy())
+
+            if labels is not None:
+                all_labels.append(labels.numpy())
+
+    # batch별로 모은 걸 하나로 합치기
+    X_feat = np.concatenate(all_feat, axis=0)
+    y = np.concatenate(all_labels, axis=0) if all_labels else None
+
+    return X_feat, y
+
 def get_predictions(loader, model, device):
     all_probs = []
     all_labels = []
@@ -346,7 +429,7 @@ val_loader = DataLoader(val_d, batch_size=64, shuffle=False)
 g_dim = g_train.shape[1]
 
 model = SwinTransformer(in_chans=1+K+2).to(device)
-criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([1], dtype=torch.float32).to(device))
+criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([5.7], dtype=torch.float32).to(device))
 optimizer = torch.optim.AdamW([
         {"params": model.backbone.parameters(),
          "lr": 5e-5},          # Swin backbone (pretrained → 작은 lr)
@@ -366,7 +449,7 @@ scheduler = get_cosine_schedule_with_warmup(optimizer,num_warmup_steps=int(0.1 *
 # )
 
 early_stopping = EarlyStopping(
-    patience=6,
+    patience=10,
     mode="max",
     delta=1e-4,
     path="best_swin_auc.pth"
@@ -410,113 +493,3 @@ for epoch in range(1, num_epochs + 1):
 best_model_path = "best_swin_auc.pth"
 model.load_state_dict(torch.load(best_model_path, map_location=device))
 model.to(device)
-
-train_pred, train_labels = get_predictions(train_loader, model, device)
-train_auc = roc_auc_score(train_labels, train_pred)
-val_pred, val_label = get_predictions(val_loader, model, device)
-val_auc = roc_auc_score(val_label, val_pred)
-
-print(f"Swin Train AUC : {train_auc:.4f}")
-print(f"Swin Val   AUC : {val_auc:.4f}")
-print(f"val_mean: {val_pred.mean(axis=0)}, val_std: {val_pred.std(axis=0)}")
-
-idx_sorted = np.argsort(val_pred)
-
-pred_bin = np.ones(len(val_pred), dtype=int)
-
-
-def competition_score(val_label, val_pred, decision_bool):
-    val_label = np.asarray(val_label)
-    decision_bool = np.asarray(decision_bool).astype(bool)
-
-    auc = roc_auc_score(val_label, val_pred)
-
-    good_mask = decision_bool & (val_label == 0)
-    bad_mask  = decision_bool & (val_label == 1)
-    tnp = 100 * good_mask.sum() - 2000 * bad_mask.sum()
-
-    s1 = max(auc - 0.5, 0) / 0.5
-    s2 = max(tnp, 0) / 20000.0
-    final = np.sqrt(s1 * s2)
-
-    return {
-        "auc": auc,
-        "total_net_profit": tnp,
-        "task1_score": s1,
-        "task2_score": s2,
-        "final_score": final,
-    }
-
-def find_best_N(val_pred, val_label, min_N=10, max_N=None):
-    val_pred = np.asarray(val_pred)
-    val_label = np.asarray(val_label)
-
-    N_total = len(val_pred)
-    max_N = round(len(val_pred) * 0.42)
-    min_N = round(len(val_pred) * 0.25)
-
-    idx_sorted = np.argsort(val_pred)  # 낮은 확률 → 승인 후보
-
-    best_N = None
-    Score = -1e9
-
-    for N in range(min_N, max_N + 1):
-        pred_bin = np.ones(N_total, dtype=int)
-        pred_bin[idx_sorted[:N]] = 0
-
-        decision_val = (pred_bin == 0)
-
-        Total_net_Profit = competition_score(val_label, val_pred, decision_val)
-        current_score = Total_net_Profit["final_score"]
-
-        if current_score > Score:
-            Score = current_score
-            best_N = N
-
-    return best_N
-
-N = find_best_N(val_pred, val_label)
-print(f"Best N = {N}")
-
-pred_bin[idx_sorted[:N]] = 0
-
-decision_val = (pred_bin == 0)
-
-cm_val = confusion_matrix(val_label, pred_bin)
-disp = ConfusionMatrixDisplay(cm_val, display_labels=['OK(0)', 'NG(1)'])
-disp.plot(cmap='Blues', values_format='d')
-plt.title("Validation Confusion Matrix")
-plt.show()
-
-
-Total_net_Profit = competition_score(val_label, val_pred, decision_val)
-print(f"Total_net_Profit: {Total_net_Profit}")
-
-# Test =============
-test_probs, _ = get_predictions(test_loader, model, device)
-
-print(f"test_mean: {test_probs.mean(axis=0)}, test_std: {test_probs.std(axis=0)}")
-
-submission = pd.read_csv("sample_submission.csv")
-submission['probability'] = np.concatenate([test_probs,test_probs])
-
-test_idx_sorted = np.argsort(test_probs)
-
-test_pred_bin = np.ones(len(test_probs), dtype=int)
-
-approval_rate = N / len(val_pred)
-test_N = int(round(approval_rate * len(test_probs)))
-
-test_pred_bin[test_idx_sorted[:test_N]] = 0
-
-test_pred = np.concatenate([test_pred_bin, test_pred_bin])
-
-decision_id_L_list = submission.iloc[:466].loc[test_pred[:466] == 0, 'ID']
-
-decision_id_P_list = submission.iloc[466:].loc[test_pred[466:] == 0, 'ID']
-
-submission.loc[submission['ID'].isin(decision_id_L_list), 'decision'] = True
-submission.loc[submission['ID'].isin(decision_id_P_list), 'decision'] = True
-
-
-submission.to_csv("my_submission.csv", index=False)
