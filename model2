@@ -1,0 +1,480 @@
+import pandas as pd
+import numpy as np
+import os
+import timm
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from collections import Counter
+from scipy.spatial.distance import cdist
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from catboost import CatBoostClassifier
+from category_encoders import CatBoostEncoder
+import xgboost
+from xgboost import XGBClassifier, plot_importance
+from scipy.stats import skew, kurtosis
+import warnings
+from sklearn.linear_model import LogisticRegression
+
+from Swin_grid import p_swin_train, p_swin_test
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+warnings.filterwarnings("ignore")
+
+train = pd.read_csv("train.csv")
+test = pd.read_csv("test.csv")
+sample_submission = pd.read_csv("sample_submission.csv")
+
+train_y = train['Class'].apply(lambda x: 1 if x == 'NG' else 0)
+
+x_loc = [f"X{i+1}" for i in range(5)]
+y_loc = [f"Y{i+1}" for i in range(5)]
+g = [f"G{i+1}" for i in range(4)]
+x_fem = [f"x{i}" for i in range(256)]
+y_fem = [f"y{i}" for i in range(256)]
+p_fem = [f"p{i}" for i in range(256)]
+
+cols_fem = x_fem + y_fem + p_fem + x_loc + y_loc
+
+import numpy as np
+
+def g_statis(df):
+    # ----- 기본 통계 -----
+    df['G_mean'] = df[g].mean(axis=1)
+    df['G_std'] = df[g].std(axis=1, ddof=0)
+    df['G_range'] = df[g].max(axis=1) - df[g].min(axis=1)
+    # ----- 1차 차분 -----
+    # df['G_d1_12'] = df['G2'] - df['G1']
+    # df['G_d1_23'] = df['G3'] - df['G2']
+    # df['G_d1_34'] = df['G4'] - df['G3']
+    # df['G_d1_mean'] = df[['G_d1_12', 'G_d1_23', 'G_d1_34']].mean(axis=1)
+    # df['G_d1_std'] = df[['G_d1_12', 'G_d1_23', 'G_d1_34']].std(axis=1)
+    # ----- 2차 차분 (곡률/가속도 느낌) -----
+    df['G_d2_2'] = df['G3'] - 2 * df['G2'] + df['G1']
+    df['G_d2_3'] = df['G4'] - 2 * df['G3'] + df['G2']
+    df['G_d2_abs_max'] = df[['G_d2_2','G_d2_3']].abs().max(axis=1)
+    return df
+
+base_train = train.drop(columns=["Class"] + cols_fem)
+base_test  = test.drop(columns=["ID"] + cols_fem)
+
+base_train = g_statis(base_train)
+base_test = g_statis(base_test)
+
+# 2) FEM 전용 DataFrame
+df_fem_train = train[cols_fem].copy()
+df_fem_test  = test[cols_fem].copy()
+
+# laplacian knn
+def add_knn_laplacian_features(df, x_fem, y_fem, p_fem,x_loc_cols, y_loc_cols, prefix="lap", k_neigh=4):
+    X = df[x_fem].to_numpy(dtype=float)  # [N, 256]
+    Y = df[y_fem].to_numpy(dtype=float)  # [N, 256]
+    P = df[p_fem].to_numpy(dtype=float)  # [N, 256]
+
+    lap_abs_mean_list = []
+    lap_abs_max_list = []
+    lap_abs_p95_list = []
+    lap_abs_std_list = []
+
+    for i in range(len(df)):
+        x = X[i]  # (256,)
+        y = Y[i]  # (256,)
+        p = P[i]  # (256,)
+
+        coords = np.stack([x, y], axis=1)  # (256, 2)
+        dists = cdist(coords, coords)  # (256, 256)
+
+        # 자기 자신 제외한 KNN
+        knn_idx = np.argsort(dists, axis=1)[:, 1:k_neigh + 1]  # [256, k]
+
+        neighbor_mean = p[knn_idx].mean(axis=1)  # [256,]
+        lap = p - neighbor_mean  # [256,]
+        lap_abs = np.abs(lap)
+
+        lap_abs_mean_list.append(lap_abs.mean())
+        lap_abs_max_list.append(lap_abs.max())
+        lap_abs_p95_list.append(np.quantile(lap_abs, 0.95))
+        lap_abs_std_list.append(lap_abs.std())
+
+    df[f"{prefix}_abs_mean"] = lap_abs_mean_list
+    df[f"{prefix}_abs_max"] = lap_abs_max_list
+    df[f"{prefix}_abs_p95"] = lap_abs_p95_list
+    df[f"{prefix}_abs_std"] = lap_abs_std_list
+    return df
+
+def pca_train(train_df, p_cols, n_components):
+    X_p = train_df[p_cols].to_numpy(dtype=float)  # [N, 256]
+
+    pca = PCA(n_components=n_components, random_state=42)
+    X_pca = pca.fit_transform(X_p)  # [N, n_components]
+
+    for i in range(n_components):
+        train_df[f"p_pca_{i}"] = X_pca[:, i]
+
+    return train_df, pca
+
+def pca_test(test_df, p_cols, pca):
+    X_p = test_df[p_cols].to_numpy(dtype=float)
+    X_pca = pca.transform(X_p)
+
+    n_components = X_pca.shape[1]
+    for i in range(n_components):
+        test_df[f"p_pca_{i}"] = X_pca[:, i]
+
+    return test_df
+
+# lap_knn
+df_fem_train = add_knn_laplacian_features(df_fem_train, x_fem, y_fem, p_fem,x_loc, y_loc,prefix="lap",k_neigh=4)
+df_fem_test  = add_knn_laplacian_features(df_fem_test, x_fem, y_fem, p_fem,x_loc, y_loc,prefix="lap",k_neigh=4)
+df_fem_train = df_fem_train.drop(columns=x_fem+y_fem+p_fem)
+df_fem_test = df_fem_test.drop(columns=x_fem+y_fem+p_fem)
+print(f"df_fem_train:{df_fem_train.shape}")
+# PCA 기반 smoothing feature도 추가
+# n_components=8
+# df_fem_train, p_pca = pca_train(df_fem_train, p_fem, n_components=n_components)
+# df_fem_test = pca_test(df_fem_test, p_fem, p_pca)
+# print("After FEM PCA :", df_fem_train[[f"p_pca_{i}" for i in range(n_components)]].shape)
+# print("FEM PCA EVR  =", p_pca.explained_variance_ratio_.sum())
+
+fem_engineered_cols = [c for c in df_fem_train.columns
+                       if c.startswith("lap_") or c.startswith("p_pca_")]
+
+FEM_train_feat = df_fem_train[fem_engineered_cols].reset_index(drop=True)
+FEM_test_feat = df_fem_test[fem_engineered_cols].reset_index(drop=True)
+
+train_feat_df = pd.concat([base_train.reset_index(drop=True),
+                           FEM_train_feat], axis=1)
+
+test_feat_df = pd.concat([base_test.reset_index(drop=True),
+                          FEM_test_feat], axis=1)
+
+train_X = train_feat_df.copy()
+test_X = test_feat_df.copy()
+
+cat_list = train_X.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+num_list = sorted(list(set(train_X.columns) - set(cat_list)))
+
+def add_row_stats(df_num: pd.DataFrame) -> pd.DataFrame:
+    df = df_num.copy()
+    df_stats = pd.DataFrame(index=df.index)
+    df_stats['r_mean'] = df.mean(axis=1)
+    df_stats['r_std'] = df.std(axis=1)
+    df_stats['r_min'] = df.min(axis=1)
+    df_stats['r_max'] = df.max(axis=1)
+    df_stats['r_median'] = df.median(axis=1)
+    df_stats['r_range'] = df_stats['r_max'] - df_stats['r_min']
+    df_stats['r_skew'] = df.apply(lambda r: skew(r), axis=1)
+    df_stats['r_kurtosis'] = df.apply(lambda r: kurtosis(r), axis=1)
+    df_stats['r_std_to_mean'] = df_stats['r_std'] / (df_stats['r_mean'].replace(0, np.nan)).abs()
+    df_stats['r_max_to_min'] = df_stats['r_max'] / (df_stats['r_min'].replace(0, np.nan)).abs()
+    df_stats = df_stats.fillna(0)
+    return pd.concat([df, df_stats], axis=1)
+
+X_num = train_X[num_list].apply(pd.to_numeric)
+X_test_num = test_X[num_list].apply(pd.to_numeric)
+
+X_num_stats = add_row_stats(X_num)
+X_test_num_stats = add_row_stats(X_test_num)
+
+# groups = train["Mass_Pilot"].astype(str) + "_" + train["Plant"].astype(str)
+
+kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=24)
+
+scale_pos_weight = 5.7
+
+model_cat = CatBoostClassifier(
+        iterations=1000,
+        learning_rate=0.02,
+        depth=6,
+        loss_function="Logloss",
+        eval_metric="AUC",
+        random_seed=42,
+        verbose=0,
+        class_weights=[1.0, float(scale_pos_weight)],
+        task_type="CPU",        # GPU 쓰면 비결정성 있을 수 있음
+        bootstrap_type="Bayesian",  # 부트스트랩 켜기
+        rsm=0.7,                  # feature subsampling
+        l2_leaf_reg=6.0,
+    )
+
+model_xgb = XGBClassifier(
+        n_estimators=1000,
+        learning_rate=0.01,
+        max_depth=6,
+        min_child_weight=10,
+        subsample=0.7,
+        colsample_bytree=0.7,
+        reg_lambda=5.0,            # L2 규제
+        reg_alpha=1.0,
+        use_label_encoder=False,
+        eval_metric="logloss",
+        scale_pos_weight=float(scale_pos_weight),
+        tree_method="hist",
+        random_state=42,
+        verbosity=0,
+        early_stopping_rounds=50
+    )
+
+oof_cat = np.zeros(len(train_y))
+oof_xgb = np.zeros(len(train_y))
+
+test_preds_cat = np.zeros(len(test_X))
+test_preds_xgb = np.zeros(len(test_X))
+
+fold_id = np.zeros(len(train_y), dtype=int)
+
+fold_indices = []
+for fold, (tr_idx, val_idx) in enumerate(kf.split(train_X, train_y), 1):
+    print(f"\n===== Fold {fold} =====")
+    fold_indices.append({"train": tr_idx, "val": val_idx})
+
+    X_tr_num = X_num_stats.iloc[tr_idx]
+    X_val_num = X_num_stats.iloc[val_idx]
+
+    X_tr_cat = train_X[cat_list].iloc[tr_idx]
+    X_val_cat = train_X[cat_list].iloc[val_idx]
+
+    X_tr_swin = p_swin_train[tr_idx]
+    X_val_swin = p_swin_train[val_idx]
+
+    y_tr = train_y.iloc[tr_idx].values
+    y_val = train_y.iloc[val_idx].values
+
+    cbe = CatBoostEncoder(cols=cat_list, random_state=42, sigma=1.0)
+    cbe.fit(X_tr_cat, y_tr)
+
+    scaler_num = StandardScaler().fit(X_tr_num)
+
+    # transform cat
+    tr_cat_enc = cbe.transform(X_tr_cat)
+    val_cat_enc = cbe.transform(X_val_cat)
+    test_cat_enc = cbe.transform(test_X[cat_list])
+
+    # transform numeric
+    tr_num_scaled = pd.DataFrame(
+        scaler_num.transform(X_tr_num),
+        columns=X_num_stats.columns,
+        index=X_tr_num.index,
+    )
+    val_num_scaled = pd.DataFrame(
+        scaler_num.transform(X_val_num),
+        columns=X_num_stats.columns,
+        index=X_val_num.index,
+    )
+    test_num_scaled = pd.DataFrame(
+        scaler_num.transform(X_test_num_stats),
+        columns=X_test_num_stats.columns,
+        index=X_test_num_stats.index,
+    )
+
+    X_tr_df = pd.concat([tr_cat_enc.reset_index(drop=True),
+                         tr_num_scaled.reset_index(drop=True)], axis=1)
+
+    X_val_df = pd.concat([val_cat_enc.reset_index(drop=True),
+                          val_num_scaled.reset_index(drop=True)], axis=1)
+
+    X_test_df = pd.concat([test_cat_enc.reset_index(drop=True),
+                           test_num_scaled.reset_index(drop=True)], axis=1)
+
+    X_tr = X_tr_df.values
+    X_val = X_val_df.values
+    X_test_fold = X_test_df.values
+
+    m_cat = model_cat.fit(X_tr, y_tr, eval_set=(X_val, y_val), use_best_model=True)
+    m_xgb = model_xgb.fit(X_tr_df, y_tr, eval_set=[(X_val_df, y_val)],verbose=False)
+
+    p_cat_tr = m_cat.predict_proba(X_tr)[:, 1]
+    p_xgb_tr = m_xgb.predict_proba(X_tr)[:, 1]
+    p_tr_ens = (p_cat_tr + p_xgb_tr + X_tr_swin) / 3.0
+
+    p_cat = m_cat.predict_proba(X_val)[:, 1]
+    p_xgb = m_xgb.predict_proba(X_val)[:, 1]
+    p_ens = (p_cat + p_xgb + X_val_swin) / 3.0
+
+    oof_cat[val_idx] = p_cat
+    oof_xgb[val_idx] = p_xgb
+    fold_id[val_idx] = fold - 1
+
+    # --- Compute AUC ---
+    train_auc = roc_auc_score(y_tr, (p_cat_tr + p_xgb_tr) / 2.0)
+    val_auc = roc_auc_score(y_val, p_ens)
+
+    print(f"Fold {fold} | Train AUC: {train_auc:.4f} | Val AUC: {val_auc:.4f}")
+
+    # test
+    p_cat_test = m_cat.predict_proba(X_test_fold)[:, 1]
+    p_xgb_test = m_xgb.predict_proba(X_test_fold)[:, 1]
+    test_preds_cat += p_cat_test / kf.n_splits
+    test_preds_xgb += p_xgb_test / kf.n_splits
+
+f1_tr_idx = fold_indices[0]["train"]
+f1_val_idx = fold_indices[0]["val"]
+f1_val_df = train.loc[f1_val_idx, ["Mass_Pilot", "Plant", "Class"]].copy()
+f1_val_df["NG_flag"] = (f1_val_df["Class"] == "NG").astype(int)
+oof_swin = p_swin_train
+
+def competition_score(val_label, val_pred, decision_bool, sample_size=466, seed=24):
+    val_label = np.asarray(val_label)
+    val_pred = np.asarray(val_pred)
+    decision_bool = np.asarray(decision_bool).astype(bool)
+
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(val_label), size=sample_size, replace=False)
+
+    # --- 샘플링된 466개만 사용 ---
+    val_label = val_label[idx]
+    val_pred = val_pred[idx]
+    decision_bool = decision_bool[idx]
+
+    auc = roc_auc_score(val_label, val_pred)
+
+    good_mask = decision_bool & (val_label == 0)
+    bad_mask  = decision_bool & (val_label == 1)
+
+    tnp = 100 * good_mask.sum() - 2000 * bad_mask.sum()
+
+    s1 = max(auc - 0.5, 0) / 0.5
+    s2 = max(tnp, 0) / 20000
+    final = np.sqrt(s1 * s2)
+
+    return {
+        "auc": auc,
+        "total_net_profit": tnp,
+        "task1_score": s1,
+        "task2_score": s2,
+        "final_score": final,
+    }
+
+def best_threshold(oof_pred, y, max_approval_ratio=0.42, fn_limit_ratio=0.017):
+    oof_pred = np.asarray(oof_pred)
+    y = np.asarray(y)
+
+    N_total = len(y)
+
+    max_approval_limit = int(N_total * max_approval_ratio)
+
+    fn_limit = int(np.floor(N_total*fn_limit_ratio))
+    print("FN limit =", fn_limit)
+
+    thresholds = np.unique(oof_pred)
+
+    best_thr = None
+    best_cm = None
+    best_score = -1e18
+
+    for thr in thresholds:
+        pred = (oof_pred > thr).astype(int)
+        cm = confusion_matrix(y, pred)
+        TN, FP, FN, TP = cm.ravel()
+
+        approval_count = (pred == 0).sum()
+        if (approval_count > max_approval_limit) :
+            continue
+
+        if FN > fn_limit:
+            continue
+
+        score = TP*FN
+
+        if score > best_score:
+            best_score = score
+            best_thr = thr
+            best_cm = cm
+    return best_thr, best_cm
+print(f"cat : {oof_cat[1]}, xgb : {oof_xgb[1]}, swin : {oof_swin[1]}")
+
+best_auc = -1
+best_w = None
+
+for a in np.linspace(0.0, 1.0, 11):       # cat weight
+    for b in np.linspace(0.0, 1.0 - a, 11):  # xgb weight
+        c = 1.0 - a - b                    # swin weight
+        if c < 0:
+            continue
+
+        p_ens = a*oof_cat + b*oof_xgb + c*oof_swin
+        auc = roc_auc_score(train_y, p_ens)
+
+        if auc > best_auc:
+            best_auc = auc
+            best_w = (a, b, c)
+
+print("Best weights (cat, xgb, swin) =", best_w)
+print("Best OOF AUC =", best_auc)
+a, b, c = best_w
+oof_preds = a*oof_cat + b*oof_xgb + c*oof_swin
+test_preds = a*test_preds_cat + b*test_preds_xgb + c*p_swin_test
+
+# 최종 OOF AUC 다시 한 번 출력
+global_auc = roc_auc_score(train_y, oof_preds)
+print(f"\nOverall OOF AUC : {global_auc:.6f}")
+
+best_thr, thr_cm = best_threshold(oof_preds, train_y, fn_limit_ratio=0.012)
+print(f"Selected Threshold: {best_thr}")
+# print("Threshold Confusion Matrix:\n", thr_cm)
+
+idx_sorted = np.argsort(oof_preds)
+print(f"oof 111: {oof_preds[idx_sorted[111]]}")
+pred_bin = (oof_preds > best_thr).astype(int)
+decision_val = (pred_bin == 0)
+
+cm_val = confusion_matrix(train_y, pred_bin)
+disp = ConfusionMatrixDisplay(cm_val, display_labels=['OK(0)', 'NG(1)'])
+disp.plot(cmap='Blues', values_format='d')
+plt.title("Validation Confusion Matrix")
+plt.show()
+
+scoress = []
+for seed in range(100):
+    Total_net_Profit = competition_score(train_y, oof_preds, decision_val, seed=seed)
+    scoress.append(Total_net_Profit["final_score"])
+print("mean =", np.mean(scoress),
+      "std  =", np.std(scoress),
+      "max  =", np.max(scoress))
+
+# Test =============
+
+submission = pd.read_csv("sample_submission.csv")
+
+submission['probability'] = np.concatenate([test_preds,test_preds])
+
+test_idx_sorted = np.argsort(test_preds)
+lowest200_preds = test_preds[test_idx_sorted[:200]]
+
+# pred_val = (oof_preds > best_thr).astype(int)
+# approval_val = (pred_val == 0).sum()
+# approval_ratio_val = approval_val / len(train_y)
+#
+# print("Validation approval ratio:", approval_ratio_val)
+# desired_ratio_test = approval_ratio_val * 0.9  # 예: 10% 더 빡세게
+# thr_from_ratio = np.quantile(test_preds, desired_ratio_test)
+
+# thr_test = min(float(best_thr), float(lowest200_preds.max()))
+print(f"test oof 111: {test_preds[test_idx_sorted[111]]}")
+test_pred_bin = (test_preds > best_thr*1.15).astype(int)
+test_approval = (test_pred_bin == 0)
+num_approval = test_approval.sum()
+
+print(f"승인(True) 개수:{num_approval}, lowest200: {lowest200_preds.max()}")
+
+test_pred = np.concatenate([test_pred_bin, test_pred_bin])
+
+decision_id_L_list = submission.iloc[:466].loc[test_pred[:466] == 0, 'ID']
+decision_id_P_list = submission.iloc[466:].loc[test_pred[466:] == 0, 'ID']
+
+submission.loc[submission['ID'].isin(decision_id_L_list), 'decision'] = True
+submission.loc[submission['ID'].isin(decision_id_P_list), 'decision'] = True
+
+
+submission.to_csv("my_submission.csv", index=False)
+
+
