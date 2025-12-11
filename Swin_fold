@@ -1,0 +1,517 @@
+import pandas as pd
+import numpy as np
+import os
+from sklearn.model_selection import StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import OneHotEncoder
+import timm
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset,DataLoader, WeightedRandomSampler
+from scipy.interpolate import griddata
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import f1_score
+import matplotlib.pyplot as plt
+from transformers import get_cosine_schedule_with_warmup
+from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.model_selection import train_test_split
+from torch.utils.data import Subset
+import xgboost as xgb
+from collections import Counter
+from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import OneHotEncoder
+import torchvision.transforms as T
+import datetime
+from sklearn.preprocessing import StandardScaler
+from category_encoders import CatBoostEncoder
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+train = pd.read_csv("train.csv")
+test = pd.read_csv("test.csv")
+
+train_X = train.drop(columns=['Class'])
+train_Y = train['Class'].apply(lambda x:1 if x=='NG' else 0)
+test_X = test.drop(columns=['ID'])
+
+x_loc = [f"X{i+1}" for i in range(5)]
+y_loc = [f"Y{i+1}" for i in range(5)]
+g = [f"G{i+1}" for i in range(4)]
+x_fem = [f"x{i}" for i in range(256)]
+y_fem = [f"y{i}" for i in range(256)]
+p_fem = [f"p{i}" for i in range(256)]
+
+cols = x_fem + y_fem + p_fem + x_loc + y_loc
+
+g1 = train_X.drop(columns=cols)[g]
+g2 = test_X.drop(columns=cols)[g]
+
+cat_list = g1.select_dtypes(include=['object', 'category', 'bool']).columns.tolist()
+num_list = sorted(list(set(g1.columns) - set(cat_list)))
+
+sgkf = StratifiedKFold(n_splits = 5, shuffle=True, random_state=2)
+
+for train_idx, val_idx in sgkf.split(train_X, train_Y):
+    break
+
+g1_train = g1.iloc[train_idx]
+g1_val   = g1.iloc[val_idx]
+y_train  = train_Y.iloc[train_idx]
+y_val    = train_Y.iloc[val_idx]
+scaler = StandardScaler().fit(g1_train[num_list])
+
+cbe = CatBoostEncoder(cols=cat_list, random_state=42, sigma=1.0)
+cbe.fit(g1_train[cat_list], y_train)
+
+fold_labels = train_Y.values[train_idx]
+class_sample_counts = np.bincount(fold_labels)
+weights = 1.0 / class_sample_counts
+sample_weights = np.array([weights[l] for l in fold_labels])
+
+sampler = WeightedRandomSampler(
+    weights=sample_weights,
+    num_samples=len(sample_weights),
+    replacement=True
+)
+
+def preprocess(dataset):
+    Xc = cbe.transform(dataset[cat_list]).values.astype("float32")
+    Xn = scaler.transform(dataset[num_list]).astype("float32")
+    return np.concatenate([Xc, Xn], axis=1)
+
+df = train[cols]
+df_test = test[cols]
+
+g_train = preprocess(g1).astype("float32")
+g_test = preprocess(g2).astype("float32")
+
+output = "fem_depth"
+os.makedirs(output,exist_ok=True)
+
+K = len(x_loc)
+
+def depth_image(x,y,p, x_loc, y_loc, H_r=8, W_theta=32,low_q=0.2,high_q=0.8,device="cpu"):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float)
+
+    cx, cy = x.mean(), y.mean()
+    dx = x - cx
+    dy = y - cy
+
+    r = np.sqrt(dx ** 2 + dy ** 2)  # [256]
+    theta = np.arctan2(dy, dx)  # [-pi, pi]
+    theta[theta < 0] += 2 * np.pi
+
+    r_max = r.max() + 1e-6
+    r_norm = r / r_max  # [0, 1]
+    theta_norm = theta / (2 * np.pi)
+
+    r_idx = np.clip((r_norm * H_r).astype(int), 0, H_r - 1)
+    t_idx = np.clip((theta_norm * W_theta).astype(int), 0, W_theta - 1)
+
+    p_mean = p.mean()
+    p_std = p.std() + 1e-6
+    p_z = (p - p_mean) / p_std
+
+    grid = np.zeros((H_r, W_theta), dtype=float)
+    count = np.zeros((H_r, W_theta), dtype=float)
+
+    for ri, ti, v in zip(r_idx, t_idx, p_z):
+        grid[ri, ti] += v
+        count[ri, ti] += 1.0
+
+    grid[count > 0] /= count[count > 0]
+
+    gy, gx = np.gradient(grid)  # gy: d/dr, gx: d/dtheta
+    grad_mag = np.sqrt(gx ** 2 + gy ** 2)
+
+    low_thr = np.quantile(grid, low_q)
+    high_thr = np.quantile(grid, high_q)
+
+    low_mask = (grid <= low_thr).astype(float)
+    high_mask = (grid >= high_thr).astype(float)
+
+    x_loc = np.asarray(x_loc, dtype=float)
+    y_loc = np.asarray(y_loc, dtype=float)
+
+    dx_loc = x_loc - cx
+    dy_loc = y_loc - cy
+
+    r_loc = np.sqrt(dx_loc ** 2 + dy_loc ** 2)
+    theta_loc = np.arctan2(dy_loc, dx_loc)
+    theta_loc[theta_loc < 0] += 2 * np.pi
+
+    r_loc_norm = r_loc / r_max  # 0~1
+    theta_loc_norm = theta_loc / (2 * np.pi)
+
+    r_loc_idx = np.clip((r_loc_norm * H_r).astype(int), 0, H_r - 1)
+    t_loc_idx = np.clip((theta_loc_norm * W_theta).astype(int), 0, W_theta - 1)
+
+    K = len(x_loc)
+    loc_masks = np.zeros((K, H_r, W_theta), dtype=float)
+
+    grid_t = torch.from_numpy(grid.astype("float32")).to(device)
+    grad_t = torch.from_numpy(grad_mag.astype("float32")).to(device)
+    low_t = torch.from_numpy(low_mask.astype("float32")).to(device)
+    high_t = torch.from_numpy(high_mask.astype("float32")).to(device)
+    loc_t = torch.from_numpy(loc_masks.astype("float32")).to(device)  # [K, H_r, W_theta]
+
+    input_tensor = torch.cat(
+        [
+            grid_t.unsqueeze(0),  # [1, H_r, W_theta]
+            grad_t.unsqueeze(0),  # [1, ...]
+            low_t.unsqueeze(0),
+            high_t.unsqueeze(0),
+            loc_t,  # [K, ...]
+        ],
+        dim=0
+    )
+
+    return input_tensor
+
+def save_image(x, y, p, x_loc, y_loc, filename="depth+mask.png"):
+    t = depth_image(x, y, p, x_loc, y_loc)
+    depth = t[0].numpy()
+    plt.imsave(filename, depth, cmap="gray")
+    print(f"saved to {filename}")
+H_r, W_theta = 8, 32
+depth_tensor_list = []
+
+X_arr = df[x_fem].to_numpy()
+Y_arr = df[y_fem].to_numpy()
+P_arr = df[p_fem].to_numpy()
+X_loc = df[x_loc].to_numpy()
+Y_loc = df[y_loc].to_numpy()
+
+for i in range(len(df)):
+    depth_tensor_list.append(
+        depth_image(
+            X_arr[i], Y_arr[i], P_arr[i],
+            X_loc[i],
+            Y_loc[i],
+            H_r=H_r,
+            W_theta=W_theta,
+            device=device,
+        )
+    )
+depth_tensor = torch.stack(depth_tensor_list, dim=0)
+print("depth_tensor shape (train):", depth_tensor.shape)
+
+depth_tensor_test_list = []
+
+X_arr_test = df_test[x_fem].to_numpy()
+Y_arr_test = df_test[y_fem].to_numpy()
+P_arr_test = df_test[p_fem].to_numpy()
+X_loc_test = df_test[x_loc].to_numpy()
+Y_loc_test = df_test[y_loc].to_numpy()
+
+for i in range(len(df_test)):
+    depth_tensor_test_list.append(
+        depth_image(
+            X_arr_test[i], Y_arr_test[i], P_arr_test[i],
+            X_loc[i],
+            Y_loc[i],
+            H_r=H_r,
+            W_theta=W_theta,
+            device=device,
+        )
+    )
+depth_tensor_test = torch.stack(depth_tensor_test_list, dim=0)
+print("depth_tensor shape (test):", depth_tensor_test.shape)
+
+#이미지 저장
+# for i in range(len(df)):
+#     x_row = X_arr[i]
+#     y_row = Y_arr[i]
+#     p_row = P_arr[i]
+#     xloc_row = X_loc[i]
+#     yloc_row = Y_loc[i]
+#
+#     filename = f"depth_{i:04d}.png"
+#     save_image(x_row, y_row, p_row, xloc_row, yloc_row, filename)
+
+class SwinTransformer(nn.Module):
+    def __init__(self, img_size=32, coord_dim=4, coord_emb_dim=96, in_chans=4+K):
+        super().__init__()
+        self.img_size = img_size
+
+        self.backbone = timm.create_model(
+            'swin_tiny_patch4_window7_224',
+            pretrained=True,
+            in_chans=in_chans,
+            num_classes=0,  # head 제거 → feature만 뽑음
+            global_pool="avg",
+            img_size=img_size,
+        )
+        backbone_dim = self.backbone.num_features
+
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(coord_dim, coord_emb_dim),
+            nn.ReLU(),
+            # nn.BatchNorm1d(coord_emb_dim),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(backbone_dim + coord_emb_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 1),
+        )
+
+    def forward_features(self, x, loc):
+        if x.shape[-1] != self.img_size or x.shape[-2] != self.img_size:
+            x = F.interpolate(
+                x,
+                size=(self.img_size, self.img_size),
+                mode="bilinear",
+                align_corners=False,
+            )  # [B, C, 32, 32]
+
+        img_feat = self.backbone(x)  # [B, backbone_dim]  (이미지 임베딩)
+        loc_feat = self.coord_mlp(loc)
+
+        fused_feat = torch.cat([img_feat, loc_feat], dim=1)  # [B, backbone_dim+coord_emb_dim]
+        return fused_feat
+
+    def forward(self, x, loc):
+        feat = self.forward_features(x, loc)
+        logit = self.classifier(feat)
+        return logit.squeeze(1)   #[B]
+
+depth_channel = depth_tensor[:, 0, :, :]  # [N,H,W]
+depth_mean = depth_channel.mean().item()
+depth_std  = depth_channel.std().item()
+
+class FEMDepthDataset(Dataset):
+    def __init__(self, depth_tensor, g_array, labels, depth_mean, depth_std):
+        self.X = depth_tensor
+        self.g = torch.tensor(g_array, dtype=torch.float32)
+        self.y = torch.tensor(labels).float()
+        self.depth_mean = depth_mean
+        self.depth_std = depth_std
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        x = self.X[idx].clone()
+        g = self.g[idx]
+        y = self.y[idx]
+
+        x[0] = (x[0] - self.depth_mean) / (self.depth_std + 1e-6)
+        return x, g, y
+
+class FEMDepthTestDataset(Dataset):
+    def __init__(self, depth_tensor_test, g_array, depth_mean, depth_std):
+        self.X = depth_tensor_test
+        self.g = torch.tensor(g_array, dtype=torch.float32)
+        self.depth_mean = depth_mean
+        self.depth_std = depth_std
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        x = self.X[idx].clone()
+        g = self.g[idx]
+
+        x[0] = (x[0] - self.depth_mean) / (self.depth_std + 1e-6)
+        return x, g
+
+class EarlyStopping:
+    def __init__(self, patience=5, mode="max", delta=1e-4, path="auc.pth"):
+        self.patience=patience
+        self.mode=mode
+        self.delta=delta
+        self.path=path
+
+        self.best_score=None
+        self.counter=0
+        self.early_stop=False
+
+    def __call__(self, metric, model):
+        score=metric
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(model)
+        else:
+            if self.mode == "max":
+                if score > self.best_score+self.delta:
+                    self.best_score = score
+                    self.save_checkpoint(model)
+                    self.counter=0
+                else:
+                    self.counter += 1
+                    if self.counter >= self.patience:
+                        self.early_stop = True
+            else:
+                raise NNotImplementedError("Only mode='max' is implemented for now.")
+
+    def save_checkpoint(self, model):
+        torch.save(model.state_dict(), self.path)
+        print(f"best_score = {self.best_score:.4f}")
+
+def get_predictions(loader, model, device):
+    all_probs = []
+    all_labels = []
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            if len(batch) == 3:
+                images, g_batch, labels = batch
+            else:
+                images, g_batch = batch
+                labels = None
+            images    = images.to(device)
+            g_batch = g_batch.to(device)
+
+            logits = model(images, g_batch)
+            probs  = torch.sigmoid(logits)  # [B]
+
+            all_probs.append(probs.cpu().numpy().ravel())
+            if labels is not None:
+                all_labels.append(labels.cpu().numpy().ravel())
+
+    all_probs  = np.concatenate(all_probs)
+    if len(all_labels) > 0:
+        all_labels = np.concatenate(all_labels)
+    else:
+        all_labels = None
+    return all_probs, all_labels
+
+num_epochs = 35
+
+dataset = FEMDepthDataset(depth_tensor, g_train, train_Y.values, depth_mean=depth_mean, depth_std=depth_std)
+
+test_dataset = FEMDepthTestDataset(depth_tensor_test, g_test, depth_mean, depth_std)
+test_loader = DataLoader(test_dataset,batch_size=64,shuffle=False)
+
+n_splits = 5
+kf_swin = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+p_swin_oof = np.zeros(len(train_Y))       # OOF prob (train용)
+p_swin_test = np.zeros(len(test_X))       # test prob (fold-avg)
+
+for fold, (tr_idx, val_idx) in enumerate(kf_swin.split(np.zeros(len(train_Y)), train_Y), 1):
+    print(f"\n===== Swin Fold {fold} =====")
+
+    # --------- fold별 dataset / loader ---------
+    train_d = Subset(dataset, tr_idx)
+    val_d = Subset(dataset, val_idx)
+
+    # fold별 클래스 가중 샘플러
+    fold_labels = train_Y.values[tr_idx]
+    class_sample_counts = np.bincount(fold_labels)
+    weights = 1.0 / class_sample_counts
+    sample_weights = np.array([weights[l] for l in fold_labels])
+
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+
+    train_loader = DataLoader(train_d, batch_size=64, sampler=sampler)
+    val_loader   = DataLoader(val_d, batch_size=64, shuffle=False)
+
+    # --------- Swin 모델 새로 생성 ---------
+    model = SwinTransformer(in_chans=4+K).to(device)
+
+    # backbone만 freeze (네가 쓰던 전략 그대로)
+    # for p in model.backbone.parameters():
+    #     p.requires_grad = False
+    #
+    # for p in model.backbone.layers[-1].parameters():
+    #     p.requires_grad = True
+
+    # loss / optimizer / scheduler / early stopping
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([5.7], dtype=torch.float32).to(device)
+    )
+
+    num_epochs = 35
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.backbone.layers.parameters(), "lr": 1e-6},
+            {"params": model.coord_mlp.parameters(), "lr": 1e-2},
+            {"params": model.classifier.parameters(), "lr": 1e-3},
+        ],
+        weight_decay=0.05,
+    )
+
+    num_training_steps = num_epochs * len(train_loader)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(0.1 * num_training_steps),
+        num_training_steps=num_training_steps,
+    )
+
+    early_stopping = EarlyStopping(
+        patience=10,
+        mode="max",
+        delta=1e-4,
+        path=f"best_swin_fold{fold}.pth",
+    )
+
+    # --------- 학습 루프 ---------
+    for epoch in range(1, num_epochs + 1):
+        model.train()
+        total_loss = 0.0
+
+        for images, g_batch, labels in train_loader:
+            images = images.to(device)
+            g_batch = g_batch.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            logits = model(images, g_batch)
+            loss = criterion(logits, labels)
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            total_loss += loss.item() * images.size(0)
+
+        mean_loss = total_loss / len(train_d)
+        train_p, train_l = get_predictions(train_loader, model, device)
+        val_p, val_l = get_predictions(val_loader, model, device)
+
+        train_auc = roc_auc_score(train_l, train_p)
+        val_auc   = roc_auc_score(val_l, val_p)
+        print(
+            f"Fold {fold} | Epoch {epoch:02d} | "
+            f"loss={mean_loss:.4f} | train_auc={train_auc:.4f} | val_auc={val_auc:.4f}"
+        )
+
+        early_stopping(val_auc, model)
+        if early_stopping.early_stop:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    # --------- best 모델 로드 후 fold 예측 ---------
+    best_model_path = f"best_swin_fold{fold}.pth"
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.to(device)
+    model.eval()
+
+    # fold의 val 구간에 대한 확률 → OOF에 채우기
+    val_p, val_l = get_predictions(val_loader, model, device)
+    p_swin_oof[val_idx] = val_p
+
+    # test 셋에 대한 확률 → fold-avg
+    test_p, _ = get_predictions(test_loader, model, device)
+    p_swin_test += test_p / n_splits
+
+# --------- Swin OOF AUC 확인 ---------
+swin_oof_auc = roc_auc_score(train_Y, p_swin_oof)
+print(f"\nSwin k-fold OOF AUC: {swin_oof_auc:.6f}")
+
+# 이후 앙상블 코드에서 쓰기 위해 이름 통일
+p_swin_train = p_swin_oof
